@@ -1,33 +1,57 @@
 from confluent_kafka import Consumer
+import boto3
+import uuid
 
+# --- 1. CONFIGURACIÓN MINIO (S3) ---
+BUCKET_NAME = 'strava-data'
+
+s3_client = boto3.client(
+    's3',
+    endpoint_url='http://localhost:9000',
+    aws_access_key_id='minioadmin',
+    aws_secret_access_key='minioadmin'
+)
+
+# --- 2. CONFIGURACIÓN KAFKA ---
 config = {
-    'bootstrap.servers': 'localhost:9092',  
-    'group.id': 'consumidor-natacion',        
-    'auto.offset.reset': 'earliest'         
+    'bootstrap.servers': 'localhost:9092',
+    'group.id': 'consumidor-natacion',
+    'auto.offset.reset': 'earliest'
 }
 
 consumer = Consumer(config)
-
 topic_kafka = 'datos_strava'
 consumer.subscribe([topic_kafka])
 
-print(f"Esperando mensajes del tópico '{topic_kafka}'...")
+print(f"🏊 ESPERANDO DATOS DE NATACIÓN en '{topic_kafka}'...")
 
 try:
     while True:
         msg = consumer.poll(1.0)
 
         if msg is None:
-            # No hay mensaje disponible en este momento, seguimos esperando
             continue
 
         if msg.error():
-            # Si hay un error en el mensaje, lo mostramos
             print(f"Error al recibir mensaje: {msg.error()}")
             continue
 
-        # Si el mensaje es válido, mostramos su contenido
-        print(f"Mensaje recibido: {msg.value().decode('utf-8')}")
+        mensaje = msg.value().decode('utf-8')
+
+        # --- 3. LÓGICA DE FILTRADO Y GUARDADO ---
+        if 'Natación' in mensaje:
+            
+            # Nombre del archivo: Natacion/dato_unico.json
+            nombre_archivo = f"Natacion/dato_{uuid.uuid4()}.json"
+
+            s3_client.put_object(
+                Bucket=BUCKET_NAME,
+                Key=nombre_archivo,
+                Body=mensaje,
+                ContentType='application/json'
+            )
+
+            print(f"✅ Guardado en MinIO: {nombre_archivo}")
 
 except KeyboardInterrupt:
     print("Programa detenido por el usuario.")
