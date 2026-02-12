@@ -1,67 +1,165 @@
-**📝 Proyecto ETL Streaming: Strava con Kafka y MinIO**
+# Post Work: Procesamiento de datos con Kafka de principio a fin
 
-**Objetivo:** Crear un pipeline de datos en tiempo real que lee un archivo CSV (actividades de Strava), lo ingesta en un sistema de mensajería (Kafka) y lo almacena filtrado en un Data Lake en la nube (simulado con MinIO), sin guardar nada en local.
+## 1. Caso de uso
 
------
-**1. Arquitectura del Sistema**
+El caso de uso que elegí es el de **health tracker data**, concretamente el procesamiento en tiempo real de actividades deportivas registradas en Strava.
 
-El flujo de datos que he diseñado funciona de forma **desacoplada**:
+La idea es la siguiente: un triatleta entrena cada día y registra sus sesiones en Strava mezcladas en un mismo archivo: natación, bicicleta y carrera todo junto. El objetivo de este pipeline es leer esos datos, separarlos automáticamente por tipo de actividad y procesarlos en tiempo real con Kafka.
 
-1. **Origen:** Archivo .csv con actividades mezcladas (Natación, Bici, Carrera).
-1. **Productor (Python):** Lee el CSV y envía todo "en bruto" a Kafka.
-1. **Broker (Kafka):** Actúa como buffer intermedio. Guarda los mensajes temporalmente.
-1. **Consumidor (Python):** Lee de Kafka, filtra solo lo que le interesa (ej. Natación) y descarta el resto.
-1. **Destino (MinIO):** Almacenamiento de objetos (S3 Compatible). Aquí persisten los datos finales organizados por carpetas.
------
-**2. Infraestructura (Docker Compose)**
+Desde el punto de vista de negocio, este sistema podría ser útil para una aplicación de triatlón que necesite mostrar estadísticas separadas por disciplina, o para un entrenador que quiera monitorizar a sus atletas sin tener que filtrar los datos a mano.
 
-He utilizado **Docker** para no instalar nada en mi máquina y tener un entorno aislado.
+---
 
-- **Zookeeper:** Es el "coordinador". Kafka (en esta versión) no funciona sin él. Gestiona los brokers y su estado.
-- **Kafka:** El corazón del sistema.
-  - He configurado KAFKA\_ADVERTISED\_LISTENERS para poder conectarme tanto desde dentro de Docker como desde mis scripts de Python en Windows.
-- **MinIO:** Mi "Nube AWS S3" en local.
-  - Puerto 9000: Para enviar datos (API).
-  - Puerto 9001: Para ver los archivos (Consola Web).
-  - **Volumen:** He añadido un volumen (minio\_data) para que los datos no se borren al apagar el contenedor.
-- **Init-Container (mc):** He creado un pequeño contenedor "truco" que arranca, crea el bucket strava-data automáticamente y se apaga. Así me ahorro crearlo a mano cada vez.
------
-**3. Lógica de Programación (Python)**
+## 2. Dataset seleccionado
 
-**A. El Productor ("Dumb Producer")**
+El dataset es una exportación real de Strava de mi padre. Es un archivo CSV llamado `jesus-activities.csv`.
 
-- No filtra nada. Su única responsabilidad es leer el CSV línea a línea y empujarlo al topic datos\_strava.
-- **Serialización:** Kafka solo entiende *bytes*. Por eso cojo el diccionario de Python (la fila del CSV), lo paso a JSON (string) y luego lo codifico a bytes (utf-8) antes de enviar.
+Lo elegí porque tenía actividades mezcladas (natación, bicicleta y carrera en el mismo archivo) y era perfecto para practicar el filtrado con consumers. Me pareció mucho más interesante que usar datos inventados.
 
-**B. El Consumidor ("Smart Consumer")**
+Los campos principales que usé son:
 
-Aquí está la inteligencia del negocio.
+| Campo | Descripción |
+|---|---|
+| `ID de actividad` | Identificador único de la actividad |
+| `Fecha de la actividad` | Fecha y hora del entreno |
+| `Nombre de la actividad` | Nombre que le pone el deportista |
+| `Tipo de actividad` | Natación, Bicicleta o Carrera |
+| `Distancia` | Distancia en km |
+| `Tiempo transcurrido` | Tiempo total en segundos |
 
-- Se conecta al topic datos\_strava.
-- **Deserialización:** Hace el proceso inverso (Bytes -> String -> Lectura).
-- **Filtrado:** Busca la palabra clave "Natación". Si está, procesa; si no, ignora.
-- **Conexión S3 (Boto3):**
-  - Usa la librería boto3 para hablar con MinIO.
-  - Usa uuid para generar nombres de archivo aleatorios y evitar sobreescribir datos (dato\_a1b2.json).
------
-**4. Conceptos Clave de Kafka (Por qué lo configuré así)**
+---
 
-**📌 auto.offset.reset: 'earliest'**
+## 3. Arquitectura implementada
 
-Esta es la configuración más importante que he aprendido.
+Esta es la arquitectura que acabé montando. 
 
-- **Problema:** Si arranco el consumidor *después* que el productor, por defecto Kafka (latest) ignora los mensajes pasados.
-- **Solución:** Al poner earliest, le digo a Kafka: *"Si soy un consumidor nuevo, dame el historial completo de mensajes desde el principio"*. Así garantizo que **no pierdo datos** del CSV aunque llegue tarde.
+```
+jesus-activities.csv
+        |
+        v
+  [ producer.py ]
+  Lee el CSV fila a fila y manda
+  cada actividad a Kafka
+        |
+        v
+  Topic: datos_strava
+  (todas las actividades mezcladas)
+        |
+        |--> [ consumer_natacion.py ]  --> Topic: natacion_procesada
+        |--> [ consumer_bicicleta.py ] --> Topic: bicicleta_procesada
+        |--> [ consumer_carrera.py ]   --> Topic: carrera_procesada
+        |
+        v
+  [ ksqlDB ]
+  Lee cada topic y muestra
+  los datos en tiempo real por pantalla
+```
 
-**📌 group.id**
+---
 
-- Es el identificador de mi equipo de consumo. Kafka usa esto para saber "por dónde se quedó leyendo" mi aplicación.
-- Si mañana creo un consumidor-bicicleta, debo darle un group.id diferente para que Kafka le entregue una copia de los mensajes solo para él.
------
-**6. Conclusión**
+## 4. Modelo de datos JSON
 
-He logrado transformar un archivo estático local en un flujo de datos distribuido. Los datos ya no viven en mi disco duro, sino que viajan por Kafka y aterrizan en un almacenamiento de objetos (MinIO), simulando una arquitectura real de Big Data en la nube.
+Una cosa que aprendí haciendo este proyecto es que Kafka solo entiende bytes, así que cada mensaje tiene que pasar por un proceso de serialización y deserialización. 
 
-![Esquema](esquema.png)
+### JSON 1 — Mensaje en bruto (producer → topic `datos_strava`)
 
-![MinIO](MINIO.png)
+El producer coge cada fila del CSV y la convierte a JSON sin tocar nada. Llegan todos los tipos mezclados:
+
+```json
+{
+  "ID de actividad": "15228065601",
+  "Fecha de la actividad": "25 jul 2025, 5:08:52",
+  "Nombre de la actividad": "Natación de mañana en piscina.",
+  "Tipo de actividad": "Natación",
+  "Distancia": "1.725",
+  "Tiempo transcurrido": "3118"
+}
+```
+
+### JSON 2 — Mensaje procesado (consumer → topic `natacion_procesada`)
+
+El consumer lee el topic general, mira el campo `Tipo de actividad` y si es "Natación" lo reenvía a su propio topic. El mensaje es el mismo, pero ahora solo llegan actividades de natación a este topic:
+
+```json
+{
+  "ID de actividad": "15228065601",
+  "Fecha de la actividad": "25 jul 2025, 5:08:52",
+  "Nombre de la actividad": "Natación de mañana en piscina.",
+  "Tipo de actividad": "Natación",
+  "Distancia": "1.725",
+  "Tiempo transcurrido": "3118"
+}
+```
+
+### JSON 3 — Mensaje final (ksqlDB lee `natacion_procesada`)
+
+ksqlDB se conecta al topic de natación y muestra solo los campos que me interesan en tiempo real:
+
+```json
+{
+  "Nombre de la actividad": "Natación de mañana en piscina.",
+  "Fecha de la actividad": "25 jul 2025, 5:08:52",
+  "Distancia": "1.725"
+}
+```
+
+---
+
+## 5. Evidencia 
+
+### Paso 1 — Ingesta: el producer manda los datos a Kafka
+
+El producer lee el CSV fila a fila y manda cada actividad al topic `datos_strava`. Le puse un `time.sleep(1)` para que fuese enviando de uno en uno y simular datos en tiempo real.
+
+![Producer](producer.png)
+
+---
+
+### Paso 2 — Procesamiento con el Consumer
+
+Los tres consumers corren en paralelo, cada uno en una terminal distinta. Los tres están suscritos al mismo topic `datos_strava` pero cada uno filtra solo su tipo de actividad y lo reenvía a su topic dedicado.
+
+Una cosa importante que configuré fue `auto.offset.reset: earliest`. Esto hace que si el consumer arranca después que el producer, no se pierda los mensajes que ya pasaron y los lea todos desde el principio.
+
+- `consumer_natacion.py` → filtra **Natación** → manda a `natacion_procesada`
+- `consumer_bicicleta.py` → filtra **Bicicleta** → manda a `bicicleta_procesada`
+- `consumer_carrera.py` → filtra **Carrera** → manda a `carrera_procesada`
+
+![Consumer Natación](consumer_natacion.png)
+
+---
+
+### Paso 3 — Procesamiento con ksqlDB
+
+Desde el CLI de ksqlDB creé un stream sobre el topic de natación. Antes de hacer el SELECT tuve que ejecutar `SET 'auto.offset.reset' = 'earliest'` porque ksqlDB por defecto solo lee mensajes nuevos, y los datos ya habían llegado antes de que yo creara el stream.
+
+```sql
+SET 'auto.offset.reset' = 'earliest';
+
+CREATE STREAM natacion_stream (
+  `Tipo de actividad` VARCHAR,
+  `Nombre de la actividad` VARCHAR,
+  `Fecha de la actividad` VARCHAR,
+  `Distancia` VARCHAR,
+  `Tiempo transcurrido` VARCHAR
+) WITH (
+  KAFKA_TOPIC = 'natacion_procesada',
+  VALUE_FORMAT = 'JSON'
+);
+```
+
+![Natacion procesada](natacion_procesada.png)
+
+---
+
+### Paso 4 — Resultado final por pantalla
+
+Con esta consulta los datos aparecen en tiempo real en la terminal:
+
+```sql
+SELECT `Nombre de la actividad`, `Fecha de la actividad`, `Distancia`
+FROM natacion_stream
+EMIT CHANGES;
+```
+
+![Resultado final](resultado_final.png)
